@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="eyebrow">Local-first · CV-driven</div>
+  <h1>Attendance, <span class="accent">automatically</span>.</h1>
+  <p class="subtitle">Enroll once with the camera. The system recognizes faces, tracks who arrived, on time or late, and exports the roster — without sending a single byte to a paid API.</p>
+  <div class="hero-stats">
+    <div class="stat">
+      <div class="stat-num">{{ people_count }}</div>
+      <div class="stat-label">enrolled</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num">{{ sessions|length }}</div>
+      <div class="stat-label">sessions</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num">∞</div>
+      <div class="stat-label">runtime cost</div>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>New session</h2>
+  <form id="session-form" class="session-form-grid" data-edit-id="">
+    <div class="sf-row">
+      <label class="sf-field sf-wide">
+        <span class="sf-label">Name</span>
+        <input name="name" required placeholder="CS101 Monday lecture" autocomplete="off">
+      </label>
+      <label class="sf-field">
+        <span class="sf-label">Type</span>
+        <select name="mode">
+          <option value="student">Class</option>
+          <option value="worker">Shift</option>
+        </select>
+      </label>
+    </div>
+    <div class="sf-row">
+      <label class="sf-field">
+        <span class="sf-label">Group</span>
+        <input name="group_name" placeholder="CS101" autocomplete="off">
+      </label>
+      <label class="sf-field">
+        <span class="sf-label">Date</span>
+        <input name="session_date" type="date" autocomplete="off" id="session-date">
+      </label>
+      <label class="sf-field">
+        <span class="sf-label">Start</span>
+        <input name="start_time" type="time" value="09:00" id="session-start-time">
+        <span class="sf-warn" id="time-warn" style="display:none"></span>
+      </label>
+      <label class="sf-field">
+        <span class="sf-label">Late after</span>
+        <input name="late_threshold_minutes" type="number" min="0" value="15" autocomplete="off">
+      </label>
+      <label class="sf-field">
+        <span class="sf-label">Duration (min)</span>
+        <input name="duration_minutes" type="number" min="0" placeholder="∞" autocomplete="off" title="Leave empty for manual end">
+      </label>
+    </div>
+
+    {% if people %}
+    <div class="member-picker">
+      <div class="member-filter-row">
+        <span class="sf-label" style="margin-right:8px">People</span>
+        <input type="text" id="member-filter" placeholder="Filter..." autocomplete="off">
+        <button type="button" id="member-select-all" class="link">All</button>
+        <button type="button" id="member-select-none" class="link">None</button>
+        <span class="muted" id="member-count" style="font-size:11px;font-family:'JetBrains Mono',monospace">0</span>
+      </div>
+      <div class="member-grid" id="member-grid">
+        {% for p in people %}
+        <label class="member-chip" data-name="{{ p.name|lower }}" data-group="{{ (p.group_name or '')|lower }}" data-eid="{{ p.external_id|lower }}">
+          <input type="checkbox" name="member_id" value="{{ p.id }}">
+          <div class="chip-avatar">{{ p.name[:2]|upper }}</div>
+          <div class="chip-info">
+            <span class="chip-name">{{ p.name }}</span>
+            <span class="chip-detail">{{ p.external_id }}{% if p.group_name %} · {{ p.group_name }}{% endif %}</span>
+          </div>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="sf-actions">
+      <span class="form-mode-label muted" id="form-mode-label"></span>
+      <button type="button" id="cancel-edit" style="display:none">Cancel</button>
+      <button type="reset">Clear</button>
+      <button type="submit" class="primary" id="form-submit">Start →</button>
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Recent sessions</h2>
+  {% if sessions %}
+    <table class="table">
+      <thead><tr><th>Name</th><th>Date</th><th>Mode</th><th>Group</th><th>Start</th><th>Duration</th><th style="text-align:right">Actions</th></tr></thead>
+      <tbody>
+      {% for s in sessions %}
+        <tr data-session='{{ s|tojson }}'>
+          <td><strong>{{ s.name }}</strong></td>
+          <td class="mono-cell">{{ s.date }}</td>
+          <td><span class="badge">{{ s.mode }}</span></td>
+          <td>{{ s.group_name or '—' }}</td>
+          <td class="mono-cell">{{ s.start_time }}</td>
+          <td class="mono-cell">{{ (s.duration_minutes|string ~ ' min') if s.duration_minutes else '—' }}</td>
+          <td class="row-actions">
+            {% if active_session and active_session.id == s.id %}
+              <button data-deactivate="{{ s.id }}" class="link danger">End</button>
+            {% else %}
+              <button data-activate="{{ s.id }}" class="link">Activate</button>
+              <a href="/api/dashboard/export?session_id={{ s.id }}" class="link" title="Download CSV">Export ↓</a>
+            {% endif %}
+            <button data-edit="{{ s.id }}" class="link">Edit</button>
+            <button data-delete="{{ s.id }}" class="link danger">Delete</button>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No sessions yet. Create one above to get started.</p>
+  {% endif %}
+</section>
+{% endblock %}

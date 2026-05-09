@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Attendance{% endblock %} · Tracker</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">A</div>
+    <a href="{{ url_for('index') }}">Attendance<span>·</span>Tracker</a>
+  </div>
+  <nav class="nav">
+    <a href="{{ url_for('enroll_page') }}" class="{% if request.endpoint=='enroll_page' %}active{% endif %}">Enroll</a>
+    <a href="{{ url_for('live_page') }}"   class="{% if request.endpoint=='live_page' %}active{% endif %}">Live</a>
+    <a href="{{ url_for('dashboard') }}"   class="{% if request.endpoint=='dashboard' %}active{% endif %}">Dashboard</a>
+  </nav>
+  <div class="topbar-right">
+    <div class="cam-picker">
+      <label>Camera</label>
+      <select id="cam-source-pick">
+        <option value="0">Webcam 0</option>
+        <option value="1">Webcam 1</option>
+        <option value="2">Webcam 2</option>
+        <option value="ipcam">IP cam URL…</option>
+      </select>
+      <input id="cam-url" type="text" placeholder="http://192.168.1.10:8080/video" style="display:none">
+      <button id="cam-apply">Apply</button>
+      <button id="cam-flip" title="Toggle the phone's front/back camera (IP Webcam app only)" style="display:none">Selfie</button>
+      <button id="cam-rotate" title="Cycle frame rotation: 0° → 90° → 180° → 270°">0°</button>
+      <span class="cam-help" title="Phone as camera: 1) Install 'IP Webcam' from the Play Store. 2) Tap Start server — the app will show a URL like http://192.168.1.42:8080. 3) Confirm it works by opening that URL in the laptop's browser. 4) Paste it here and click Apply. Phone and laptop must be on the same Wi-Fi.">?</span>
+    </div>
+    <div class="badges">
+      <span class="badge {% if recognition_path.get('backend') == 'lbp' %}warn{% elif recognition_path.get('backend') %}ok{% endif %}"
+            title="Face recognition backend in use">
+        {{ recognition_path.get('backend', 'init…') }}
+      </span>
+      <span class="badge mono" id="fps-badge" title="Frames per second">– fps</span>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+  {% if recognition_path.get('backend') == 'lbp' %}
+    <div class="warn-banner">
+      <h4>⚠ Recognition is on the LBP fallback — lowest accuracy</h4>
+      <p>Better backends failed to load. Restart the app to pick up <code>facenet-pytorch</code> (MTCNN + FaceNet, 512-d embeddings, no compilation needed).</p>
+    </div>
+  {% endif %}
+
+  {% if active_session %}
+    <div class="session-banner">
+      <span class="mono-tag">active session</span>
+      <strong>{{ active_session.name }}</strong>
+      &middot; mode <code class="mono">{{ active_session.mode }}</code>
+      {% if active_session.group_name %}&middot; group <code class="mono">{{ active_session.group_name }}</code>{% endif %}
+      &middot; starts {{ active_session.start_time }} (late after {{ active_session.late_threshold_minutes }}m)
+      {% if active_session.duration_minutes %}&middot; duration {{ active_session.duration_minutes }}m{% endif %}
+      &middot; {{ active_session.date }}
+      <button class="end-session-btn" onclick="fetch('/api/sessions/deactivate',{method:'POST'}).then(()=>location.reload())">End session</button>
+    </div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+
+<script>
+window.__camera_source = "{{ camera_source|e }}";
+</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
