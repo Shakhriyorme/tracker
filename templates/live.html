@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Live{% endblock %}
+{% block content %}
+<div class="grid-2">
+  <section class="card">
+    <div class="row-between" style="margin-bottom:12px">
+      <h2 style="margin:0">Live recognition</h2>
+      <a href="/api/live/snapshot" download id="snap-btn" class="button" title="Save the current annotated frame as a JPEG. Hotkey: S">📸 Snapshot</a>
+    </div>
+    <div class="video-frame big">
+      <img id="live-stream" src="{{ url_for('video_feed') }}" alt="live">
+    </div>
+    <div class="hud-row">
+      <div><span class="muted">FPS</span> <strong id="hud-fps">–</strong></div>
+      <div><span class="muted">In frame</span> <strong id="hud-in">0</strong></div>
+      <div><span class="muted">Identified</span> <strong id="hud-id">0</strong></div>
+      <div><span class="muted">Unknown</span> <strong id="hud-unk">0</strong></div>
+    </div>
+    <p class="muted" style="font-size:11px;margin-top:10px;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em">Hotkey: <kbd>S</kbd> snapshot</p>
+  </section>
+
+  <section class="card">
+    <h2>Just arrived</h2>
+    <ul id="just-arrived" class="arrivals"></ul>
+    <h3>Currently in frame</h3>
+    <div id="in-frame-list" class="muted">–</div>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  setInterval(window.__pollLiveStatus, 1500);
+
+  // Hotkey S → click the snapshot link (browser handles the download)
+  document.addEventListener("keydown", (ev) => {
+    if (ev.repeat) return;
+    const tag = (document.activeElement?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    if (ev.key === "s" || ev.key === "S") {
+      ev.preventDefault();
+      document.getElementById("snap-btn").click();
+    }
+  });
+</script>
+{% endblock %}

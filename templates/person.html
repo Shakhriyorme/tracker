@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ person.name }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="person-head">
+    <div class="avatar-circle">{{ person.name[:2]|upper }}</div>
+    <div>
+      <h2>{{ person.name }}</h2>
+      <p class="muted"><span class="mono">{{ person.external_id }}</span> · {{ person.role }}{% if person.group_name %} · {{ person.group_name }}{% endif %}</p>
+      <p>Attendance (last 30 days): <strong id="person-pct">–</strong></p>
+    </div>
+  </div>
+</section>
+
+<div class="grid-2">
+  <section class="card">
+    <h3>Last 30 days</h3>
+    <div id="cal-grid" class="cal-grid"></div>
+    <div class="cal-legend">
+      <span><span class="dot present"></span>present</span>
+      <span><span class="dot late"></span>late</span>
+      <span><span class="dot absent"></span>absent</span>
+      <span><span class="dot none"></span>no session</span>
+    </div>
+  </section>
+  <section class="card">
+    <h3>Attendance %</h3>
+    <canvas id="pctChart" height="180"></canvas>
+  </section>
+</div>
+
+<section class="card">
+  <h3>Recent arrivals</h3>
+  <table class="table" id="history-table">
+    <thead><tr><th>Date</th><th>Session</th><th>Status</th><th>Arrival</th><th>Departure</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+  const PERSON_ID = {{ person.id|tojson }};
+  window.addEventListener("DOMContentLoaded", () => window.__loadPerson(PERSON_ID));
+</script>
+{% endblock %}
