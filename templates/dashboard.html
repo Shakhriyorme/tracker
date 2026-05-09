@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="row-between">
+    <h2 id="dash-title">Dashboard</h2>
+    <div style="display:flex;gap:8px">
+      <button id="dash-refresh">Refresh</button>
+      <a id="dash-export" class="button" href="#">Export CSV</a>
+    </div>
+  </div>
+  <div class="kpi-row">
+    <div class="kpi present"><div class="kpi-num" id="kpi-present">–</div><div class="kpi-label">present</div></div>
+    <div class="kpi late"><div class="kpi-num" id="kpi-late">–</div><div class="kpi-label">late</div></div>
+    <div class="kpi absent"><div class="kpi-num" id="kpi-absent">–</div><div class="kpi-label">absent</div></div>
+    <div class="kpi total"><div class="kpi-num" id="kpi-total">–</div><div class="kpi-label">total</div></div>
+    <div class="kpi unknown"><div class="kpi-num" id="kpi-unknown">–</div><div class="kpi-label">unknown</div></div>
+  </div>
+</section>
+
+<div class="grid-2">
+  <section class="card">
+    <h3>Hourly arrivals</h3>
+    <canvas id="hourlyChart" height="180"></canvas>
+  </section>
+  <section class="card">
+    <h3>Roster</h3>
+    <table class="table" id="roster-table">
+      <thead><tr><th></th><th>Name</th><th>ID</th><th>Status</th><th>Arrival</th><th>Hours</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</div>
+
+<section class="card">
+  <h3>Recent unknown sightings</h3>
+  <p class="muted" style="font-size:12px;margin-bottom:12px">Unknowns are tracked by count only — no images saved. All recognition runs on 512-d embedding vectors (2 KB each).</p>
+  <div id="unknowns-grid" class="thumbs-grid"></div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+  const SESSION_ID = {{ session_id|tojson }};
+  window.addEventListener("DOMContentLoaded", () => window.__loadDashboard(SESSION_ID));
+  document.getElementById("dash-refresh").onclick = () => window.__loadDashboard(SESSION_ID);
+</script>
+{% endblock %}
