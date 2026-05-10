@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Enroll{% endblock %}
+{% block content %}
+<div class="grid-2">
+  <section class="card">
+    <h2>Enroll a person</h2>
+    <h3>Camera preview</h3>
+    <div class="video-frame">
+      <img id="enroll-stream" src="{{ url_for('video_feed') }}" alt="webcam">
+    </div>
+    <div class="form-intro">
+      Position the person in front of the camera. Each click captures one <strong>embedding</strong> (512-d vector) — no photos are saved. For best accuracy, capture <strong>3 angles</strong>: front, left, right.
+    </div>
+
+    <form id="enroll-form">
+      <div class="enroll-sections">
+        <div class="enroll-section">
+          <div class="section-tag">1 · Identity</div>
+          <div class="field-pair">
+            <label>
+              <span class="field-name">Full name</span>
+              <input name="name" required placeholder="e.g. Alice Anderson" autocomplete="off">
+            </label>
+            <label>
+              <span class="field-name">ID number</span>
+              <input name="external_id" required placeholder="e.g. S1001" autocomplete="off">
+              <span class="help-text">Same ID = updates the existing person.</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="enroll-section">
+          <div class="section-tag">2 · Classification</div>
+          <div class="field-pair">
+            <label>
+              <span class="field-name">Group / class</span>
+              <input name="group_name" placeholder="e.g. CS101, Engineering" autocomplete="off">
+              <span class="help-text">Must match the session's group to be counted.</span>
+            </label>
+            <label>
+              <span class="field-name">Role</span>
+              <select name="role">
+                <option value="student">Student</option>
+                <option value="worker">Worker</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="enroll-section">
+          <div class="section-tag">3 · Capture</div>
+          <label>
+            <span class="field-name">Face angle</span>
+            <select name="pose" id="pose-select">
+              <option value="front">Front — look at camera</option>
+              <option value="left">Left — turn head left</option>
+              <option value="right">Right — turn head right</option>
+            </select>
+            <span class="help-text">One per angle. Advances automatically.</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="enroll-actions">
+        <button type="reset">Clear</button>
+        <button type="submit" class="primary" id="enroll-btn">Capture front →</button>
+      </div>
+    </form>
+    <div id="enroll-status" class="status" style="display:none"></div>
+  </section>
+
+  <section class="card">
+    <h2>Already enrolled <span class="muted" style="font-family:'JetBrains Mono',monospace;font-size:14px">({{ people|length }})</span></h2>
+    <div id="enrolled-list" class="thumbs-grid">
+      {% for p in people %}
+      <div class="thumb-card" data-pid="{{ p.id }}">
+        <div class="avatar-initials">{{ p.name[:2]|upper }}</div>
+        <div class="thumb-meta">
+          <strong>{{ p.name }}</strong>
+          <small>{{ p.external_id }} · {{ p.role }}{% if p.group_name %} · {{ p.group_name }}{% endif %}</small>
+          <div style="display:flex;gap:8px;margin-top:4px">
+            <button class="link delete" data-del="{{ p.id }}">delete</button>
+            <a class="link" href="{{ url_for('person_page', pid=p.id) }}">history →</a>
+          </div>
+        </div>
+      </div>
+      {% else %}
+      <p class="muted">No one enrolled yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}
