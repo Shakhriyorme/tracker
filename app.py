@@ -1,28 +1,26 @@
-from flask import Flask, Response, render_template, request, jsonify
+"""Flask entry point. We built this to wire the camera, YOLO, and tracking pipeline together."""
+from flask import Flask, Response, jsonify, render_template, request
 import cv2
 import numpy as np
 import threading
 import time
 import os
 import logging
+from datetime import datetime, timedelta
 from tracker import TrackerWithIdentity
 from camera import Camera
+import db as DB
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("attendance.app")
-
 app = Flask(__name__)
 
-# I kept dummy data here temporarily so my partner's frontend doesn't break.
+# I kept dummy data temporarily so the frontend loads without errors.
 people_count = 24
-sessions = [
-    {'name': 'CS101 Monday', 'date': '2026-05-09'},
-    {'name': 'CS101 Wednesday', 'date': '2026-05-07'},
-]
+sessions = [{'name': 'CS101 Monday', 'date': '2026-05-09'}, {'name': 'CS101 Wednesday', 'date': '2026-05-07'}]
 recognition_path = {'backend': 'facenet'}
 
 class Pipeline:
-    """I created this class to manage the entire detection -> tracking -> recognition flow."""
     def __init__(self):
         self.camera = None
         self.yolo = None
@@ -38,7 +36,7 @@ class Pipeline:
         self.live_listeners = 0
 
     def yolo_model(self):
-        # I lazy-load YOLO here so the app starts instantly even if the model downloads in the background.
+        # I lazy-load YOLO here so the app starts instantly.
         if self.yolo is None:
             from ultralytics import YOLO
             self.yolo = YOLO(os.environ.get("YOLO_MODEL", "yolov8n.pt"))
@@ -46,7 +44,6 @@ class Pipeline:
         return self.yolo
 
     def set_camera(self, source: str | int = 0, rotation: int = 0) -> bool:
-        # I added this method to safely switch cameras without crashing the pipeline.
         if self.camera:
             self.camera.stop()
         self.camera = Camera(source, rotation=rotation)
@@ -95,7 +92,6 @@ class Pipeline:
                 fps_n, fps_t = 0, time.time()
 
     def annotate_frame(self, frame_bgr):
-        # I implemented the YOLO + SORT pipeline here. Currently, it just draws tracked boxes.
         try:
             results = self.yolo_model()(frame_bgr, verbose=False, classes=[0], imgsz=480)
             boxes = results[0].boxes
@@ -115,7 +111,49 @@ class Pipeline:
 
 PIPELINE = Pipeline()
 
-# I set up the MJPEG generator here so multiple browser tabs can watch the live stream without blocking.
+# I implemented this helper to check for an active session and auto-end it if duration expires.
+def active_session_id() -> int | None:
+    with DB.SessionLocal() as s:
+        v = DB.get_config(s, "active_session_id")
+        if not v:
+            return None
+        sid = int(v)
+        sess = s.get(DB.Session_, sid)
+        if not sess:
+            DB.del_config(s, "active_session_id")
+            return None
+        if sess.duration_minutes:
+            end_dt = datetime.combine(sess.date, sess.start_time) + timedelta(minutes=sess.duration_minutes)
+            if datetime.now() >= end_dt:
+                log.info("I auto-ended session '%s' because duration expired.", sess.name)
+                DB.del_config(s, "active_session_id")
+                return None
+        return sid
+
+@app.route("/api/sessions/activate", methods=["POST"])
+def api_activate_session():
+    I added this route so the frontend can start a session and persist the ID in the DB.
+    body = request.json or {}
+    name = body.get("name", "Default Session")
+    mode = body.get("mode", "student")
+    duration = body.get("duration_minutes")
+    if duration:
+        duration = int(duration)
+
+    with DB.SessionLocal() as s:
+        sess = DB.ensure_session(s, name=name, mode=mode, duration_minutes=duration)
+        DB.set_config(s, "active_session_id", str(sess.id))
+    PIPELINE.start_processing()
+    return jsonify({"ok": True, "session_id": sess.id})
+
+@app.route("/api/sessions/deactivate", methods=["POST"])
+def api_deactivate_session():
+    with DB.SessionLocal() as s:
+        DB.del_config(s, "active_session_id")
+    if not PIPELINE.live_listeners:
+        PIPELINE.stop_processing()
+    return jsonify({"ok": True})
+
 @app.route("/video_feed")
 def video_feed():
     if not PIPELINE.camera or not PIPELINE.camera.is_open():
@@ -140,32 +178,27 @@ def video_feed():
             PIPELINE.live_listeners = max(0, PIPELINE.live_listeners - 1)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# I kept my partner's original routes intact so the UI works immediately.
 @app.route('/')
 def index():
     return render_template('index.html', people_count=people_count, sessions=sessions, recognition_path=recognition_path, request=request)
 
 @app.route('/enroll')
-def enroll_page():
-    return render_template('base.html', recognition_path=recognition_path, request=request)
+def enroll_page(): return render_template('base.html', recognition_path=recognition_path, request=request)
 
 @app.route('/live')
-def live_page():
-    return render_template('base.html', recognition_path=recognition_path, request=request)
+def live_page(): return render_template('base.html', recognition_path=recognition_path, request=request)
 
 @app.route('/dashboard')
-def dashboard():
-    return render_template('base.html', recognition_path=recognition_path, request=request)
+def dashboard(): return render_template('base.html', recognition_path=recognition_path, request=request)
 
 @app.route('/api/status')
 def api_status():
     return jsonify(PIPELINE.last_status)
 
 if __name__ == '__main__':
-    # I start with a default camera so the pipeline can initialize smoothly.
+    DB.init_db()
     PIPELINE.set_camera(0)
+    # I resume processing automatically if a session was left active.
+    if active_session_id() is not None:
+        PIPELINE.start_processing()
     app.run(debug=True, port=5000, threaded=True)
-
-"""We built this Flask entry point to wire the camera, YOLO, and tracker together.
-We set up the background processing loop and the MJPEG live stream here.
-"""
