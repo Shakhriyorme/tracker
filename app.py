@@ -1,3 +1,15 @@
+"""Flask app entry point.
+We wire together camera + YOLO + SORT + face recognition + DB. One Pipeline
+instance is shared across the live-stream consumers.
+Run:
+    python app.py
+Env:
+    DATABASE_URL    sqlite (default) or postgresql://... for Neon
+    HOST, PORT      bind options (default 127.0.0.1:5000)
+    YOLO_MODEL      override (default yolov8n.pt)
+    RECOGNITION     force backend: insightface | dlib | lbp
+"""
+from __future__ import annotations
 import csv
 import io
 import logging
@@ -7,6 +19,7 @@ import time
 from datetime import date as Date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
 import cv2
 import numpy as np
 from flask import (
@@ -52,7 +65,7 @@ class Pipeline:
         self._frame_lock = threading.Lock()
 
     def yolo_model(self):
-        """We lazy-load YOLO so the app starts instantly even if the model downloads."""
+        """We lazy-load YOLO so the Flask server starts instantly even if the model downloads."""
         if self.yolo is None:
             with self._yolo_lock:
                 if self.yolo is None:
@@ -164,8 +177,6 @@ class Pipeline:
                 identified += 1
             else:
                 unknown += 1
-
-            # We trigger recognition only for unknown tracks that pass cooldown & max attempts
             if not recognized_this_frame and self.tracker.needs_recognition(info):
                 self.tracker.mark_attempt(info)
                 self._try_recognize(info, rgb, session_id)
@@ -312,6 +323,14 @@ def _session_to_dict(sess: DB.Session_, member_ids: list[int] | None = None) -> 
         d["member_ids"] = member_ids
     return d
 
+def _person_to_dict(p: DB.Person) -> dict:
+    return {
+        "id": p.id, "external_id": p.external_id, "name": p.name,
+        "group_name": p.group_name, "role": p.role,
+        "thumbnail": (url_for("static", filename=p.thumbnail_path) if p.thumbnail_path else None),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
 @app.context_processor
 def inject_globals():
     with DB.SessionLocal() as s:
@@ -417,6 +436,33 @@ def api_camera():
             PIPELINE.start_processing()
     return jsonify({"ok": ok, "rotation": rot, "error": (None if ok else (PIPELINE.camera.last_error if PIPELINE.camera else "open failed"))})
 
+@app.route("/api/camera/toggle_front", methods=["POST"])
+def api_camera_toggle_front():
+    cam = PIPELINE.camera
+    if not cam or not isinstance(cam.source, str) or not cam.source.startswith(("http://", "https://")):
+        return jsonify({"error": "Only works when the camera is a phone IP-cam URL."}), 400
+    use_front = not PIPELINE.ffc_front
+    from urllib.parse import urlparse
+    import urllib.request
+    u = urlparse(cam.source)
+    base = f"{u.scheme}://{u.netloc}"
+    target = f"{base}/settings/ffc?set={'on' if use_front else 'off'}"
+    try:
+        with urllib.request.urlopen(target, timeout=3) as r:
+            r.read()
+    except Exception as e:
+        return jsonify({"error": f"Phone didn't respond at {target}: {e}"}), 502
+    PIPELINE.ffc_front = use_front
+    rot = 270 if use_front else 90
+    was_processing = PIPELINE.is_processing
+    if was_processing: PIPELINE.stop_processing()
+    with DB.SessionLocal() as s:
+        DB.set_config(s, "camera_rotation", str(rot))
+        PIPELINE.set_camera(cam.source, rotation=rot)
+        if was_processing or active_session_id() is not None:
+            PIPELINE.start_processing()
+    return jsonify({"ok": True, "front": use_front, "rotation": rot})
+
 @app.route("/api/sessions", methods=["GET", "POST"])
 def api_sessions():
     if request.method == "POST":
@@ -475,13 +521,41 @@ def api_deactivate_session():
         PIPELINE.stop_processing()
     return jsonify({"ok": True})
 
-def _person_to_dict(p: DB.Person) -> dict:
-    return {
-        "id": p.id, "external_id": p.external_id, "name": p.name,
-        "group_name": p.group_name, "role": p.role,
-        "thumbnail": (url_for("static", filename=p.thumbnail_path) if p.thumbnail_path else None),
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-    }
+@app.route("/api/sessions/<int:sid>", methods=["DELETE", "PATCH"])
+def api_session_modify(sid: int):
+    if request.method == "DELETE":
+        with DB.SessionLocal() as s:
+            sess = s.get(DB.Session_, sid)
+            if not sess: return jsonify({"error": "not found"}), 404
+            active = DB.get_config(s, "active_session_id")
+            if active and active.isdigit() and int(active) == sid:
+                DB.del_config(s, "active_session_id")
+            s.delete(sess); s.commit()
+        return jsonify({"ok": True})
+    body = request.json or {}
+    with DB.SessionLocal() as s:
+        sess = s.get(DB.Session_, sid)
+        if not sess: return jsonify({"error": "not found"}), 404
+        if "name" in body and body["name"]: sess.name = body["name"].strip()
+        if "mode" in body and body["mode"] in ("student", "worker"): sess.mode = body["mode"]
+        if "group_name" in body: sess.group_name = body["group_name"] or None
+        if "start_time" in body and body["start_time"]:
+            from datetime import time as Time
+            h, m = [int(x) for x in body["start_time"].split(":")]
+            sess.start_time = Time(h, m)
+        if "late_threshold_minutes" in body and body["late_threshold_minutes"] not in (None, ""):
+            sess.late_threshold_minutes = int(body["late_threshold_minutes"])
+        if "duration_minutes" in body:
+            dur = body["duration_minutes"]
+            sess.duration_minutes = int(dur) if dur not in (None, "", 0, "0") else None
+        if "session_date" in body and body["session_date"]:
+            from datetime import date as Date_
+            sess.date = Date_.fromisoformat(body["session_date"])
+        if "member_ids" in body:
+            DB.set_session_members(s, sid, [int(x) for x in (body["member_ids"] or [])])
+        s.commit(); s.refresh(sess)
+        mids = DB.get_session_member_ids(s, sid)
+        return jsonify(_session_to_dict(sess, member_ids=mids))
 
 @app.route("/api/persons")
 def api_persons():
@@ -727,69 +801,6 @@ def api_thumbs_wipe():
             if u.thumbnail_path: u.thumbnail_path = None; cleared += 1
         s.commit()
     return jsonify({"deleted_files": deleted_files, "cleared_rows": cleared, "store_thumbnails": STORE_THUMBNAILS})
-
-@app.route("/api/sessions/<int:sid>", methods=["DELETE", "PATCH"])
-def api_session_modify(sid: int):
-    if request.method == "DELETE":
-        with DB.SessionLocal() as s:
-            sess = s.get(DB.Session_, sid)
-            if not sess: return jsonify({"error": "not found"}), 404
-            active = DB.get_config(s, "active_session_id")
-            if active and active.isdigit() and int(active) == sid:
-                DB.del_config(s, "active_session_id")
-            s.delete(sess); s.commit()
-        return jsonify({"ok": True})
-    body = request.json or {}
-    with DB.SessionLocal() as s:
-        sess = s.get(DB.Session_, sid)
-        if not sess: return jsonify({"error": "not found"}), 404
-        if "name" in body and body["name"]: sess.name = body["name"].strip()
-        if "mode" in body and body["mode"] in ("student", "worker"): sess.mode = body["mode"]
-        if "group_name" in body: sess.group_name = body["group_name"] or None
-        if "start_time" in body and body["start_time"]:
-            from datetime import time as Time
-            h, m = [int(x) for x in body["start_time"].split(":")]
-            sess.start_time = Time(h, m)
-        if "late_threshold_minutes" in body and body["late_threshold_minutes"] not in (None, ""):
-            sess.late_threshold_minutes = int(body["late_threshold_minutes"])
-        if "duration_minutes" in body:
-            dur = body["duration_minutes"]
-            sess.duration_minutes = int(dur) if dur not in (None, "", 0, "0") else None
-        if "session_date" in body and body["session_date"]:
-            from datetime import date as Date_
-            sess.date = Date_.fromisoformat(body["session_date"])
-        if "member_ids" in body:
-            DB.set_session_members(s, sid, [int(x) for x in (body["member_ids"] or [])])
-        s.commit(); s.refresh(sess)
-        mids = DB.get_session_member_ids(s, sid)
-        return jsonify(_session_to_dict(sess, member_ids=mids))
-
-@app.route("/api/camera/toggle_front", methods=["POST"])
-def api_camera_toggle_front():
-    cam = PIPELINE.camera
-    if not cam or not isinstance(cam.source, str) or not cam.source.startswith(("http://", "https://")):
-        return jsonify({"error": "Only works when the camera is a phone IP-cam URL."}), 400
-    use_front = not PIPELINE.ffc_front
-    from urllib.parse import urlparse
-    import urllib.request
-    u = urlparse(cam.source)
-    base = f"{u.scheme}://{u.netloc}"
-    target = f"{base}/settings/ffc?set={'on' if use_front else 'off'}"
-    try:
-        with urllib.request.urlopen(target, timeout=3) as r:
-            r.read()
-    except Exception as e:
-        return jsonify({"error": f"Phone didn't respond at {target}: {e}"}), 502
-    PIPELINE.ffc_front = use_front
-    rot = 270 if use_front else 90
-    was_processing = PIPELINE.is_processing
-    if was_processing: PIPELINE.stop_processing()
-    with DB.SessionLocal() as s:
-        DB.set_config(s, "camera_rotation", str(rot))
-        PIPELINE.set_camera(cam.source, rotation=rot)
-        if was_processing or active_session_id() is not None:
-            PIPELINE.start_processing()
-    return jsonify({"ok": True, "front": use_front, "rotation": rot})
 
 # =================================================================== Entry ===
 def _startup():
