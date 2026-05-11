@@ -1,0 +1,16 @@
+# OPTIONAL face-recognition backends. Install only ONE if you can.
+# Order them best-first; the app probes at startup and uses whichever is importable.
+#
+# 1) insightface (preferred) — best accuracy, small models, CPU-friendly.
+#    On Windows this builds a wheel from source unless your Python version has a
+#    prebuilt one. If it fails: skip it; the next backend or LBP will still work.
+#
+#    Usage:    pip install -r requirements-face.txt
+#    If that fails:  pip install insightface --no-build-isolation
+#    Last resort:    delete this file's lines and use the LBP fallback.
+insightface>=0.7
+onnxruntime>=1.16
+
+# 2) face_recognition / dlib — alternate. Needs CMake + VS Build Tools on Windows
+#    to compile dlib. Uncomment if insightface won't go.
+# face_recognition>=1.3.0

@@ -1,1 +1,20 @@
+# Core — must install cleanly. Pure-Python or have prebuilt wheels for Win/Mac/Linux.
 flask>=3.0
+sqlalchemy>=2.0
+numpy>=1.24,<2.2
+opencv-python>=4.8
+ultralytics>=8.1
+filterpy>=1.4.5
+scipy>=1.11
+pillow>=10
+python-dotenv>=1.0
+
+# Postgres (Neon) — optional at runtime; only used if DATABASE_URL=postgresql://...
+# Both ship binary wheels so installing them on Windows is fine even if you stay on SQLite.
+psycopg[binary]>=3.1
+pgvector>=0.2.5
+
+# Face recognition — facenet-pytorch is pure Python + PyTorch (no compilation).
+# Uses MTCNN detection + InceptionResnetV1 (VGGFace2) for 512-d embeddings.
+facenet-pytorch>=2.5
+tqdm
