@@ -1,8 +1,11 @@
 """Flask app entry point.
-We wire together camera + YOLO + SORT + face recognition + DB. One Pipeline
+
+Wires together camera + YOLO + SORT + face recognition + DB. One Pipeline
 instance is shared across the live-stream consumers.
+
 Run:
     python app.py
+
 Env:
     DATABASE_URL    sqlite (default) or postgresql://... for Neon
     HOST, PORT      bind options (default 127.0.0.1:5000)
@@ -10,6 +13,7 @@ Env:
     RECOGNITION     force backend: insightface | dlib | lbp
 """
 from __future__ import annotations
+
 import csv
 import io
 import logging
@@ -37,13 +41,17 @@ log = logging.getLogger("attendance.app")
 
 THUMBS_DIR = Path("static/thumbs")
 THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+
 STORE_THUMBNAILS = os.environ.get("STORE_THUMBNAILS", "false").lower() in ("1", "true", "yes", "on")
 
 app = Flask(__name__)
 
-# =================================================================== Pipeline ===
+
+# =============================================================== Pipeline ===
+
 class Pipeline:
-    """We own the camera, YOLO, tracker, and recognition. We keep it thread-safe."""
+    """Owns camera, YOLO, tracker, recognition. Thread-safe over the live loop."""
+
     def __init__(self):
         self.camera: Optional[Camera] = None
         self.yolo = None
@@ -58,25 +66,26 @@ class Pipeline:
         self._fps_t = time.time()
         self._fps_n = 0
         self._yolo_lock = threading.Lock()
+        # Background processing thread
         self._proc_thread: Optional[threading.Thread] = None
         self._proc_stop = threading.Event()
         self._frame_jpeg: bytes | None = None
         self._frame_seq = 0
         self._frame_lock = threading.Lock()
 
+    # ----- yolo lazy load --------------------------------------------------
     def yolo_model(self):
-        """We lazy-load YOLO so the Flask server starts instantly even if the model downloads."""
         if self.yolo is None:
             with self._yolo_lock:
                 if self.yolo is None:
                     from ultralytics import YOLO
                     name = os.environ.get("YOLO_MODEL", "yolov8n.pt")
-                    log.info("We are loading YOLO model: %s", name)
+                    log.info("Loading YOLO: %s", name)
                     self.yolo = YOLO(name)
         return self.yolo
 
+    # ----- camera ----------------------------------------------------------
     def set_camera(self, source: str | int, rotation: int = 0) -> bool:
-        """We safely switch the camera source and apply rotation if needed."""
         with self.lock:
             if self.camera:
                 self.camera.stop()
@@ -92,7 +101,6 @@ class Pipeline:
             return 0
 
     def ensure_camera(self) -> bool:
-        """We restore the last used camera from DB config if available."""
         if self.camera and self.camera.is_open():
             return True
         with DB.SessionLocal() as s:
@@ -100,32 +108,30 @@ class Pipeline:
             rotation = self._safe_rotation(DB.get_config(s, "camera_rotation", "0"))
         return self.set_camera(saved or "0", rotation=rotation)
 
+    # ----- background processing thread ------------------------------------
     def start_processing(self) -> None:
-        """We spawn a background thread to run the detection-tracking loop."""
         if self._proc_thread and self._proc_thread.is_alive():
             return
         if not self.ensure_camera():
-            log.warning("We cannot start processing because the camera isn't ready.")
+            log.warning("Cannot start processing — camera unavailable")
             return
         self._proc_stop.clear()
         self._proc_thread = threading.Thread(target=self._process_loop, name="pipeline", daemon=True)
         self._proc_thread.start()
-        log.info("We started the background processing thread.")
+        log.info("Background processing started")
 
     def stop_processing(self) -> None:
-        """We gracefully stop the processing thread and release resources."""
         self._proc_stop.set()
         if self._proc_thread:
             self._proc_thread.join(timeout=2)
             self._proc_thread = None
-        log.info("We stopped the background processing thread.")
+        log.info("Background processing stopped")
 
     @property
     def is_processing(self) -> bool:
         return self._proc_thread is not None and self._proc_thread.is_alive()
 
     def _process_loop(self) -> None:
-        """We run the main frame pipeline: read -> detect -> track -> annotate -> cache."""
         last_idx = -1
         sid = active_session_id()
         sid_refresh = time.time()
@@ -150,11 +156,15 @@ class Pipeline:
                 with self._frame_lock:
                     self._frame_jpeg = data
                     self._frame_seq += 1
-        log.info("We exited the processing loop.")
+        log.info("Processing loop exited")
 
+    # ----- main per-frame step --------------------------------------------
     def annotate_frame(self, frame_bgr: np.ndarray, session_id: int | None) -> np.ndarray:
-        """We run detection -> tracking -> recognition -> annotate. Returns BGR frame."""
+        """Run detection -> tracking -> recognition -> annotate. Returns BGR frame."""
+        h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        # YOLO person detection
         try:
             results = self.yolo_model()(frame_bgr, verbose=False, classes=[0], imgsz=480)
             boxes = results[0].boxes
@@ -165,35 +175,41 @@ class Pipeline:
             else:
                 dets = np.empty((0, 5))
         except Exception as e:
-            log.exception("We skipped YOLO inference due to error: %s", e)
+            log.exception("YOLO failed: %s", e)
             dets = np.empty((0, 5))
 
+        # SORT
         active = self.tracker.step(dets)
-        identified = unknown = 0
-        recognized_this_frame = False
 
+        identified = 0
+        unknown = 0
+        recognized_this_frame = False
         for info in active:
             if info.name:
                 identified += 1
             else:
                 unknown += 1
+
             if not recognized_this_frame and self.tracker.needs_recognition(info):
                 self.tracker.mark_attempt(info)
                 self._try_recognize(info, rgb, session_id)
                 recognized_this_frame = True
 
         self._draw(frame_bgr, active)
+
+        # FPS
         self._fps_n += 1
         now = time.time()
         if now - self._fps_t >= 1.0:
             self.last_status["fps"] = round(self._fps_n / (now - self._fps_t), 1)
             self._fps_n = 0
             self._fps_t = now
-        self.last_status.update({"in_frame": len(active), "identified": identified, "unknown": unknown})
+        self.last_status["in_frame"] = len(active)
+        self.last_status["identified"] = identified
+        self.last_status["unknown"] = unknown
         return frame_bgr
 
     def _try_recognize(self, info: TrackInfo, rgb: np.ndarray, session_id: int | None):
-        """We crop the face, run recognition, and attach identity if match passes threshold."""
         x1, y1, x2, y2 = info.bbox
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(rgb.shape[1], x2), min(rgb.shape[0], y2)
@@ -203,7 +219,7 @@ class Pipeline:
         try:
             faces = REC.detect_and_embed(crop)
         except Exception as e:
-            log.exception("We skipped recognition due to error: %s", e)
+            log.exception("recognition error: %s", e)
             return
         if not faces:
             return
@@ -211,24 +227,29 @@ class Pipeline:
 
         with DB.SessionLocal() as s:
             person, dist = DB.find_nearest(s, face.embedding, threshold=self.match_threshold)
-            log.debug("We found track %d nearest dist=%.3f (threshold=%.2f) person=%s",
-                      info.track_id, dist, self.match_threshold,
-                      person.name if person else "none")
+            log.debug("track %d: nearest dist=%.3f (threshold=%.2f) person=%s",
+                       info.track_id, dist, self.match_threshold,
+                       person.name if person else "none")
             if person is None:
                 if info.recognition_attempts >= self.tracker.max_attempts:
                     s.add(DB.Unknown(session_id=session_id))
                     s.commit()
                 return
 
-            # We implement a duplicate-identity guard to prevent one person claiming two tracks
+            # Duplicate-identity guard: if another active track already claims
+            # this person, only the closer match keeps the identity. The other
+            # track stays unknown until it actually gets a better match elsewhere.
             existing = next(
                 (t for t in self.tracker._infos.values()
                  if t.person_id == person.id and t.track_id != info.track_id),
                 None,
             )
             if existing is not None:
-                log.info("We blocked duplicate identity for %s on track %d (already on track %d)",
-                         person.name, info.track_id, existing.track_id)
+                # We don't store the other track's distance, so we use a simple
+                # tiebreaker: the OLDER track (more frames) keeps the identity.
+                # The newer/lower-confidence track stays unknown for now.
+                log.info("Skipping duplicate identity assign for %s on track %d "
+                         "(already on track %d)", person.name, info.track_id, existing.track_id)
                 return
 
             self.tracker.assign_identity(info, person.id, person.name)
@@ -238,7 +259,7 @@ class Pipeline:
                     DB.record_arrival(s, person.id, sess)
 
     def cache_jpeg(self, frame_bgr: np.ndarray, quality: int = 80) -> bytes | None:
-        """We encode + cache the latest annotated frame for live streaming."""
+        """Encode + cache the latest annotated frame for /api/live/snapshot."""
         ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             return None
@@ -247,34 +268,44 @@ class Pipeline:
         return data
 
     PERSON_PALETTE = [
-        (212, 182, 6), (94, 197, 34), (246, 92, 139), (0, 215, 255),
-        (255, 191, 0), (180, 105, 255), (0, 255, 127), (255, 144, 30),
-        (50, 205, 154), (147, 20, 255), (0, 165, 255), (203, 192, 100),
+        (212, 182, 6),    # teal
+        (94, 197, 34),    # green
+        (246, 92, 139),   # purple
+        (0, 215, 255),    # gold
+        (255, 191, 0),    # sky blue
+        (180, 105, 255),  # pink
+        (0, 255, 127),    # spring green
+        (255, 144, 30),   # dodger blue
+        (50, 205, 154),   # aquamarine
+        (147, 20, 255),   # deep pink
+        (0, 165, 255),    # orange
+        (203, 192, 100),  # light steel
     ]
-    UNKNOWN_COLOR = (70, 70, 230)
+    UNKNOWN_COLOR = (70, 70, 230)  # red BGR
 
     def _draw(self, frame: np.ndarray, tracks: list[TrackInfo]) -> None:
-        """We draw bounding boxes, names, and a HUD status bar on the frame."""
         pal = self.PERSON_PALETTE
         for info in tracks:
             x1, y1, x2, y2 = info.bbox
-            color = pal[info.person_id % len(pal)] if info.person_id else self.UNKNOWN_COLOR
+            if info.person_id:
+                color = pal[info.person_id % len(pal)]
+            else:
+                color = self.UNKNOWN_COLOR
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             label = f"{info.name}" if info.name else f"unknown #{info.track_id}"
             label_w = 8 + int(9.5 * len(label))
             cv2.rectangle(frame, (x1, y1 - 22), (x1 + label_w, y1), color, -1)
-            txt_color = (15, 15, 15) if info.name else (255, 255, 255)
+            text_color = (15, 15, 15) if info.name else (255, 255, 255)
             cv2.putText(frame, label, (x1 + 4, y1 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, txt_color, 1, cv2.LINE_AA)
-        hud = f"{self.last_status['fps']:.1f} fps | in: {self.last_status['in_frame']} | id: {self.last_status['identified']} | unk: {self.last_status['unknown']}"
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 1, cv2.LINE_AA)
+        hud = f"{self.last_status['fps']:.1f} fps  |  in-frame {self.last_status['in_frame']}  |  id'd {self.last_status['identified']}  |  unk {self.last_status['unknown']}"
         cv2.rectangle(frame, (0, 0), (frame.shape[1], 26), (11, 11, 6), -1)
         cv2.putText(frame, hud, (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 240), 1, cv2.LINE_AA)
 
     @staticmethod
     def _save_thumb(rgb: np.ndarray, prefix: str = "thumb") -> str | None:
-        """We save a thumbnail to disk if enabled."""
         if not STORE_THUMBNAILS:
-            return None
+            return None  # matrix-only mode: never write pixels to disk
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         fname = f"{prefix}_{ts}.jpg"
         out = THUMBS_DIR / fname
@@ -282,14 +313,17 @@ class Pipeline:
         cv2.imwrite(str(out), bgr)
         return f"thumbs/{fname}"
 
+
 PIPELINE = Pipeline()
 
-# =================================================================== Helpers ===
+
+# ============================================================ helpers / routes
+
 def active_session_id() -> int | None:
-    """We check DB for an active session and auto-end it if duration expires."""
     with DB.SessionLocal() as s:
         v = DB.get_config(s, "active_session_id")
-        if not v: return None
+        if not v:
+            return None
         sid = int(v)
         sess = s.get(DB.Session_, sid)
         if not sess:
@@ -298,18 +332,22 @@ def active_session_id() -> int | None:
         if sess.duration_minutes:
             end_dt = datetime.combine(sess.date, sess.start_time) + timedelta(minutes=sess.duration_minutes)
             if datetime.now() >= end_dt:
-                log.info("We auto-ended session '%s' due to duration limit.", sess.name)
+                log.info("Auto-ending session '%s' (duration %dm expired)", sess.name, sess.duration_minutes)
                 DB.del_config(s, "active_session_id")
                 return None
         return sid
 
+
 def active_session_dict() -> dict | None:
     sid = active_session_id()
-    if not sid: return None
+    if not sid:
+        return None
     with DB.SessionLocal() as s:
         sess = s.get(DB.Session_, sid)
-        if not sess: return None
+        if not sess:
+            return None
         return _session_to_dict(sess)
+
 
 def _session_to_dict(sess: DB.Session_, member_ids: list[int] | None = None) -> dict:
     d = {
@@ -323,62 +361,73 @@ def _session_to_dict(sess: DB.Session_, member_ids: list[int] | None = None) -> 
         d["member_ids"] = member_ids
     return d
 
-def _person_to_dict(p: DB.Person) -> dict:
-    return {
-        "id": p.id, "external_id": p.external_id, "name": p.name,
-        "group_name": p.group_name, "role": p.role,
-        "thumbnail": (url_for("static", filename=p.thumbnail_path) if p.thumbnail_path else None),
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-    }
 
 @app.context_processor
 def inject_globals():
     with DB.SessionLocal() as s:
         cam = DB.get_config(s, "camera_source", "0")
-        return {
-            "camera_source": cam or "0",
-            "active_session": active_session_dict(),
-            "recognition_path": PIPELINE.recognition_path or {},
-            "db_backend": "postgres" if DB.IS_POSTGRES else "sqlite",
-            "pgvector": DB.PGVECTOR_AVAILABLE,
-        }
+    return {
+        "camera_source": cam or "0",
+        "active_session": active_session_dict(),
+        "recognition_path": PIPELINE.recognition_path or {},
+        "db_backend": "postgres" if DB.IS_POSTGRES else "sqlite",
+        "pgvector": DB.PGVECTOR_AVAILABLE,
+    }
 
-# =================================================================== Routes ===
+
+# ----- Pages ----------------------------------------------------------------
+
 @app.route("/")
 def index():
     with DB.SessionLocal() as s:
-        sess_rows = s.execute(select(DB.Session_).order_by(DB.Session_.date.desc(), DB.Session_.id.desc())).scalars().all()
-        sessions = [_session_to_dict(x) for x in sess_rows]
+        sess_rows = s.execute(
+            select(DB.Session_).order_by(DB.Session_.date.desc(), DB.Session_.id.desc())
+        ).scalars().all()
+        sessions = []
+        for x in sess_rows:
+            mids = DB.get_session_member_ids(s, x.id)
+            sessions.append(_session_to_dict(x, member_ids=mids))
         people = s.execute(select(DB.Person).order_by(DB.Person.name)).scalars().all()
-    return render_template("index.html", sessions=sessions, people_count=len(people), people=people)
+        people_list = [_person_to_dict(p) for p in people]
+        people_count = len(people_list)
+    return render_template("index.html", sessions=sessions, people_count=people_count, people=people_list)
+
 
 @app.route("/enroll")
 def enroll_page():
     with DB.SessionLocal() as s:
         people = s.execute(select(DB.Person).order_by(DB.Person.created_at.desc())).scalars().all()
+        people = [_person_to_dict(p) for p in people]
     return render_template("enroll.html", people=people)
+
 
 @app.route("/live")
 def live_page():
     return render_template("live.html")
+
 
 @app.route("/dashboard")
 def dashboard():
     sid = active_session_id()
     return render_template("dashboard.html", session_id=sid)
 
+
 @app.route("/person/<int:pid>")
 def person_page(pid: int):
     with DB.SessionLocal() as s:
         p = s.get(DB.Person, pid)
-    if not p: abort(404)
+        if not p:
+            abort(404)
     return render_template("person.html", person=_person_to_dict(p))
+
+
+# ----- MJPEG stream ---------------------------------------------------------
 
 @app.route("/video_feed")
 def video_feed():
-    """We stream MJPEG frames to any number of concurrent browser tabs."""
     if not PIPELINE.ensure_camera():
         return Response("Camera not available", status=503)
+
     def gen():
         PIPELINE.live_listeners += 1
         PIPELINE.start_processing()
@@ -397,7 +446,11 @@ def video_feed():
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n")
         finally:
             PIPELINE.live_listeners = max(0, PIPELINE.live_listeners - 1)
+
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+# ----- API: status / camera / sessions / persons / enrollment --------------
 
 @app.route("/api/status")
 def api_status():
@@ -416,6 +469,7 @@ def api_status():
         "processing": PIPELINE.is_processing,
     })
 
+
 @app.route("/api/camera", methods=["POST"])
 def api_camera():
     body = request.json or {}
@@ -423,11 +477,15 @@ def api_camera():
     if src is None or src == "":
         return jsonify({"ok": False, "error": "missing source"}), 400
     is_ip = not str(src).strip().isdigit()
-    rot = 270 if PIPELINE.ffc_front else 90 if is_ip else 0
+    if is_ip:
+        rot = 270 if PIPELINE.ffc_front else 90
+    else:
+        rot = 0
     with DB.SessionLocal() as s:
         DB.set_config(s, "camera_rotation", str(rot))
     was_processing = PIPELINE.is_processing
-    if was_processing: PIPELINE.stop_processing()
+    if was_processing:
+        PIPELINE.stop_processing()
     ok = PIPELINE.set_camera(src, rotation=rot)
     if ok:
         with DB.SessionLocal() as s:
@@ -436,32 +494,23 @@ def api_camera():
             PIPELINE.start_processing()
     return jsonify({"ok": ok, "rotation": rot, "error": (None if ok else (PIPELINE.camera.last_error if PIPELINE.camera else "open failed"))})
 
-@app.route("/api/camera/toggle_front", methods=["POST"])
-def api_camera_toggle_front():
-    cam = PIPELINE.camera
-    if not cam or not isinstance(cam.source, str) or not cam.source.startswith(("http://", "https://")):
-        return jsonify({"error": "Only works when the camera is a phone IP-cam URL."}), 400
-    use_front = not PIPELINE.ffc_front
-    from urllib.parse import urlparse
-    import urllib.request
-    u = urlparse(cam.source)
-    base = f"{u.scheme}://{u.netloc}"
-    target = f"{base}/settings/ffc?set={'on' if use_front else 'off'}"
+
+@app.route("/api/camera/rotation", methods=["POST"])
+def api_camera_rotation():
+    body = request.json or {}
+    rot = body.get("rotation", 0)
     try:
-        with urllib.request.urlopen(target, timeout=3) as r:
-            r.read()
-    except Exception as e:
-        return jsonify({"error": f"Phone didn't respond at {target}: {e}"}), 502
-    PIPELINE.ffc_front = use_front
-    rot = 270 if use_front else 90
-    was_processing = PIPELINE.is_processing
-    if was_processing: PIPELINE.stop_processing()
+        rot = int(rot)
+    except (ValueError, TypeError):
+        return jsonify({"error": "rotation must be 0, 90, 180, or 270"}), 400
+    if rot not in (0, 90, 180, 270):
+        return jsonify({"error": "rotation must be 0, 90, 180, or 270"}), 400
     with DB.SessionLocal() as s:
         DB.set_config(s, "camera_rotation", str(rot))
-        PIPELINE.set_camera(cam.source, rotation=rot)
-        if was_processing or active_session_id() is not None:
-            PIPELINE.start_processing()
-    return jsonify({"ok": True, "front": use_front, "rotation": rot})
+    if PIPELINE.camera:
+        PIPELINE.camera.rotation = rot
+    return jsonify({"ok": True, "rotation": str(rot)})
+
 
 @app.route("/api/sessions", methods=["GET", "POST"])
 def api_sessions():
@@ -475,7 +524,8 @@ def api_sessions():
         dur_raw = body.get("duration_minutes")
         duration = int(dur_raw) if dur_raw not in (None, "", 0, "0") else None
         date_str = (body.get("session_date") or "").strip()
-        if not name: return jsonify({"error": "name required"}), 400
+        if not name:
+            return jsonify({"error": "name required"}), 400
         from datetime import time as Time, date as Date_
         h, m = [int(x) for x in start.split(":")]
         for_date = Date_.fromisoformat(date_str) if date_str else None
@@ -500,9 +550,11 @@ def api_sessions():
                 return jsonify(_session_to_dict(sess, member_ids=mids))
         except Exception as e:
             return jsonify({"error": str(e)}), 400
+
     with DB.SessionLocal() as s:
         rows = s.execute(select(DB.Session_).order_by(DB.Session_.date.desc())).scalars().all()
         return jsonify([_session_to_dict(x) for x in rows])
+
 
 @app.route("/api/sessions/<int:sid>/activate", methods=["POST"])
 def api_activate_session(sid: int):
@@ -513,6 +565,7 @@ def api_activate_session(sid: int):
     PIPELINE.start_processing()
     return jsonify({"ok": True})
 
+
 @app.route("/api/sessions/deactivate", methods=["POST"])
 def api_deactivate_session():
     with DB.SessionLocal() as s:
@@ -521,24 +574,417 @@ def api_deactivate_session():
         PIPELINE.stop_processing()
     return jsonify({"ok": True})
 
+
+def _person_to_dict(p: DB.Person) -> dict:
+    return {
+        "id": p.id, "external_id": p.external_id, "name": p.name,
+        "group_name": p.group_name, "role": p.role,
+        "thumbnail": (url_for("static", filename=p.thumbnail_path) if p.thumbnail_path else None),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
+
+
+@app.route("/api/persons")
+def api_persons():
+    with DB.SessionLocal() as s:
+        rows = s.execute(select(DB.Person).order_by(DB.Person.name)).scalars().all()
+        return jsonify([_person_to_dict(p) for p in rows])
+
+
+@app.route("/api/persons/<int:pid>", methods=["DELETE"])
+def api_delete_person(pid: int):
+    with DB.SessionLocal() as s:
+        p = s.get(DB.Person, pid)
+        if not p:
+            return jsonify({"error": "not found"}), 404
+        s.delete(p)
+        s.commit()
+    for info in list(PIPELINE.tracker._infos.values()):
+        if info.person_id == pid:
+            info.person_id = None
+            info.name = None
+            info.recognition_attempts = 0
+            info.last_recognition_frame = -10**9
+    return jsonify({"ok": True})
+
+
+@app.route("/api/enroll/precheck", methods=["POST"])
+def api_enroll_precheck():
+    """Grab a frame, run recognition. If someone is already enrolled, return their info."""
+    if not PIPELINE.ensure_camera():
+        return jsonify({"recognized": False})
+    frame, _ = PIPELINE.camera.read()
+    if frame is None:
+        return jsonify({"recognized": False})
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    faces = REC.detect_and_embed(rgb)
+    if not faces:
+        return jsonify({"recognized": False, "face_detected": False})
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    detected_pose = REC.estimate_pose(rgb, mirror=PIPELINE.ffc_front)
+    with DB.SessionLocal() as s:
+        person, dist = DB.find_nearest(s, face.embedding, threshold=PIPELINE.match_threshold)
+        if person:
+            return jsonify({
+                "recognized": True,
+                "person": _person_to_dict(person),
+                "distance": round(dist, 3),
+                "pose": detected_pose,
+                "samples": DB.count_samples(s, person.id),
+            })
+    return jsonify({"recognized": False, "face_detected": True, "pose": detected_pose})
+
+
+@app.route("/api/enroll", methods=["POST"])
+def api_enroll():
+    body = request.json or {}
+    name = (body.get("name") or "").strip()
+    ext_id = (body.get("external_id") or "").strip()
+    group = body.get("group_name") or None
+    role = body.get("role") or "student"
+    pose = (body.get("pose") or "").strip().lower() or None
+    if not name or not ext_id:
+        return jsonify({"error": "name and external_id required"}), 400
+    if not PIPELINE.ensure_camera():
+        return jsonify({"error": "camera not available"}), 503
+
+    for _retry in range(20):
+        frame, _idx = PIPELINE.camera.read()
+        if frame is not None:
+            break
+        time.sleep(0.05)
+    if frame is None:
+        return jsonify({"error": "no frame from camera"}), 400
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    faces = REC.detect_and_embed(rgb)
+    if not faces:
+        return jsonify({"error": "no face detected"}), 400
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+
+    detected_pose = REC.estimate_pose(rgb, mirror=PIPELINE.ffc_front)
+
+    emb = face.embedding
+    n = emb / (np.linalg.norm(emb) + 1e-9)
+
+    with DB.SessionLocal() as s:
+        existing = s.execute(select(DB.Person).where(DB.Person.external_id == ext_id)).scalar_one_or_none()
+        if existing:
+            person = existing
+            person.name = name
+            person.group_name = group
+            person.role = role
+        else:
+            person = DB.Person(name=name, external_id=ext_id, group_name=group, role=role)
+            s.add(person)
+            s.flush()
+
+        # Replace old sample for this pose instead of stacking indefinitely
+        if pose:
+            old = s.execute(
+                select(DB.FaceSample).where(
+                    DB.FaceSample.person_id == person.id,
+                    DB.FaceSample.pose_label == pose,
+                )
+            ).scalars().all()
+            for o in old:
+                s.delete(o)
+
+        DB.add_face_sample(s, person, n, pose_label=pose)
+        DB.store_embedding(person, n)
+        s.commit()
+        total_samples = DB.count_samples(s, person.id)
+        for info in PIPELINE.tracker._infos.values():
+            if info.person_id is None:
+                info.recognition_attempts = 0
+                info.last_recognition_frame = -10**9
+        return jsonify({
+            "ok": True, "person": _person_to_dict(person),
+            "total_samples": total_samples,
+            "pose": pose,
+            "detected_pose": detected_pose,
+            "is_update": existing is not None,
+        })
+
+
+# ----- API: dashboard data --------------------------------------------------
+
+@app.route("/api/dashboard")
+def api_dashboard():
+    sid = request.args.get("session_id", type=int) or active_session_id()
+    if not sid:
+        return jsonify({"error": "no active session"}), 404
+    with DB.SessionLocal() as s:
+        sess = s.get(DB.Session_, sid)
+        if not sess:
+            return jsonify({"error": "not found"}), 404
+        attendances = s.execute(
+            select(DB.Attendance).where(DB.Attendance.session_id == sid)
+        ).scalars().all()
+        att_by_pid = {a.person_id: a for a in attendances}
+
+        member_ids = DB.get_session_member_ids(s, sid)
+        if member_ids:
+            att_pids = list(att_by_pid.keys())
+            all_ids = list(set(member_ids) | set(att_pids))
+            people_q = select(DB.Person).where(DB.Person.id.in_(all_ids))
+        elif sess.group_name:
+            att_pids = list(att_by_pid.keys())
+            if att_pids:
+                people_q = select(DB.Person).where(
+                    or_(DB.Person.group_name == sess.group_name,
+                        DB.Person.id.in_(att_pids))
+                )
+            else:
+                people_q = select(DB.Person).where(DB.Person.group_name == sess.group_name)
+        else:
+            people_q = select(DB.Person)
+        people = s.execute(people_q).scalars().all()
+
+        present, late, absent = 0, 0, 0
+        rows = []
+        for p in people:
+            a = att_by_pid.get(p.id)
+            if a is None:
+                status = "absent"
+                absent += 1
+            elif a.status == "late":
+                status = "late"; late += 1
+            else:
+                status = "present"; present += 1
+            rows.append({
+                "person_id": p.id, "name": p.name, "external_id": p.external_id,
+                "status": status,
+                "arrival_ts": a.arrival_ts.isoformat() if a else None,
+                "departure_ts": a.departure_ts.isoformat() if a and a.departure_ts else None,
+                "hours": (
+                    round((a.departure_ts - a.arrival_ts).total_seconds() / 3600, 2)
+                    if a and a.departure_ts else None
+                ),
+                "thumbnail": (url_for("static", filename=p.thumbnail_path) if p.thumbnail_path else None),
+            })
+
+        # Hourly arrivals histogram — scoped to session window
+        start_h = sess.start_time.hour
+        if sess.duration_minutes:
+            end_dt = datetime.combine(sess.date, sess.start_time) + timedelta(minutes=sess.duration_minutes)
+            end_h = min(end_dt.hour + 1, 24)
+        else:
+            end_h = max((a.arrival_ts.hour + 1 for a in attendances), default=start_h + 1)
+            end_h = max(end_h, datetime.now().hour + 1) if sess.date == Date.today() else end_h
+        end_h = min(max(end_h, start_h + 1), 24)
+        hourly_range = list(range(start_h, end_h))
+        hourly = {h: 0 for h in hourly_range}
+        for a in attendances:
+            h = a.arrival_ts.hour
+            if h in hourly:
+                hourly[h] += 1
+
+        # Unknowns count for this session
+        unk_count = s.execute(
+            select(func.count(DB.Unknown.id)).where(DB.Unknown.session_id == sid)
+        ).scalar() or 0
+
+        return jsonify({
+            "session": _session_to_dict(sess),
+            "counts": {"present": present, "late": late, "absent": absent, "total": len(people)},
+            "rows": rows,
+            "hourly_labels": [f"{h}:00" for h in hourly_range],
+            "hourly": list(hourly.values()),
+            "unknown_count": int(unk_count),
+        })
+
+
+@app.route("/api/dashboard/export")
+def api_dashboard_export():
+    sid = request.args.get("session_id", type=int) or active_session_id()
+    if not sid:
+        return Response("no active session", 404)
+    with DB.SessionLocal() as s:
+        sess = s.get(DB.Session_, sid)
+        if not sess:
+            return Response("not found", 404)
+        att_rows = s.execute(
+            select(DB.Attendance).where(DB.Attendance.session_id == sid)).scalars().all()
+        att_by_pid = {a.person_id: a for a in att_rows}
+        member_ids = DB.get_session_member_ids(s, sid)
+        if member_ids:
+            all_ids = list(set(member_ids) | set(att_by_pid.keys()))
+            people_q = select(DB.Person).where(DB.Person.id.in_(all_ids))
+        elif sess.group_name:
+            att_pids = list(att_by_pid.keys())
+            if att_pids:
+                people_q = select(DB.Person).where(
+                    or_(DB.Person.group_name == sess.group_name,
+                        DB.Person.id.in_(att_pids))
+                )
+            else:
+                people_q = select(DB.Person).where(DB.Person.group_name == sess.group_name)
+        else:
+            people_q = select(DB.Person)
+        people = s.execute(people_q).scalars().all()
+
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["external_id", "name", "group", "role", "status", "arrival_ts", "departure_ts", "hours"])
+        for p in people:
+            a = att_by_pid.get(p.id)
+            status = "absent" if a is None else a.status
+            arr = a.arrival_ts.isoformat() if a else ""
+            dep = a.departure_ts.isoformat() if a and a.departure_ts else ""
+            hrs = (
+                round((a.departure_ts - a.arrival_ts).total_seconds() / 3600, 2)
+                if a and a.departure_ts else ""
+            )
+            w.writerow([p.external_id, p.name, p.group_name or "", p.role, status, arr, dep, hrs])
+
+        data = out.getvalue().encode("utf-8")
+        fname = f"attendance_{sess.name}_{sess.date.isoformat()}.csv"
+        return Response(data, mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+# ----- API: person history --------------------------------------------------
+
+@app.route("/api/person/<int:pid>")
+def api_person(pid: int):
+    with DB.SessionLocal() as s:
+        p = s.get(DB.Person, pid)
+        if not p:
+            return jsonify({"error": "not found"}), 404
+        # last 30 days, joined with session for the date
+        cutoff = Date.today() - timedelta(days=30)
+        rows = s.execute(
+            select(DB.Attendance, DB.Session_).join(DB.Session_)
+            .where(DB.Attendance.person_id == pid, DB.Session_.date >= cutoff)
+            .order_by(DB.Session_.date.desc())
+        ).all()
+        history = []
+        by_date: dict[str, str] = {}
+        for a, sess in rows:
+            d = sess.date.isoformat()
+            history.append({
+                "date": d, "session": sess.name, "status": a.status,
+                "arrival_ts": a.arrival_ts.isoformat(),
+                "departure_ts": a.departure_ts.isoformat() if a.departure_ts else None,
+            })
+            # priority for the calendar tile color: late beats present
+            if d not in by_date or by_date[d] == "present":
+                by_date[d] = a.status
+        # build last 30 days grid
+        grid = []
+        for i in range(29, -1, -1):
+            day = Date.today() - timedelta(days=i)
+            grid.append({"date": day.isoformat(), "status": by_date.get(day.isoformat(), "none")})
+        # attendance %
+        sessions_total = s.execute(
+            select(func.count(DB.Session_.id)).where(DB.Session_.date >= cutoff)
+        ).scalar() or 0
+        present_count = sum(1 for h in history if h["status"] in ("present", "late"))
+        pct = round(100 * present_count / sessions_total, 1) if sessions_total else 0.0
+        return jsonify({
+            "person": _person_to_dict(p),
+            "history": history,
+            "grid": grid,
+            "attendance_pct": pct,
+            "sessions_total": int(sessions_total),
+        })
+
+
+# ----- API: unknowns --------------------------------------------------------
+
+@app.route("/api/unknowns")
+def api_unknowns():
+    with DB.SessionLocal() as s:
+        rows = s.execute(
+            select(DB.Unknown).order_by(DB.Unknown.seen_ts.desc()).limit(60)
+        ).scalars().all()
+        return jsonify([
+            {"id": u.id, "seen_ts": u.seen_ts.isoformat(),
+             "thumbnail": (url_for("static", filename=u.thumbnail_path) if u.thumbnail_path else None),
+             "session_id": u.session_id}
+            for u in rows
+        ])
+
+
+@app.route("/api/health")
+def api_health():
+    return jsonify({"ok": True, "ts": datetime.now().isoformat()})
+
+
+@app.route("/api/live/snapshot")
+def api_live_snapshot():
+    """Return the current annotated frame as a downloadable JPEG.
+    Uses the cached frame from the MJPEG generator if /live is open;
+    otherwise grabs + annotates one frame on demand."""
+    data = PIPELINE.last_jpeg
+    if data is None:
+        if not PIPELINE.ensure_camera():
+            return Response("camera not available", 503)
+        frame, _ = PIPELINE.camera.read()
+        if frame is None:
+            return Response("no frame from camera", 503)
+        with PIPELINE.lock:
+            annotated = PIPELINE.annotate_frame(frame, active_session_id())
+        data = PIPELINE.cache_jpeg(annotated, quality=90)
+        if data is None:
+            return Response("encode failed", 500)
+    fname = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    return Response(data, mimetype="image/jpeg",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+@app.route("/api/thumbs/wipe", methods=["POST"])
+def api_thumbs_wipe():
+    """Delete every JPEG in static/thumbs/ and null every thumbnail_path column.
+    Embeddings (matrices) are untouched — recognition keeps working."""
+    deleted_files = 0
+    for f in THUMBS_DIR.glob("*"):
+        try:
+            f.unlink(); deleted_files += 1
+        except OSError:
+            pass
+    with DB.SessionLocal() as s:
+        cleared = 0
+        for p in s.execute(select(DB.Person)).scalars():
+            if p.thumbnail_path:
+                p.thumbnail_path = None; cleared += 1
+        for u in s.execute(select(DB.Unknown)).scalars():
+            if u.thumbnail_path:
+                u.thumbnail_path = None; cleared += 1
+        s.commit()
+    return jsonify({"deleted_files": deleted_files, "cleared_rows": cleared,
+                    "store_thumbnails": STORE_THUMBNAILS})
+
+
+# ----- Session edit / delete ----------------------------------------------
+
 @app.route("/api/sessions/<int:sid>", methods=["DELETE", "PATCH"])
 def api_session_modify(sid: int):
     if request.method == "DELETE":
         with DB.SessionLocal() as s:
             sess = s.get(DB.Session_, sid)
-            if not sess: return jsonify({"error": "not found"}), 404
+            if not sess:
+                return jsonify({"error": "not found"}), 404
+            # If this is the active session, clear it so /live and /dashboard
+            # don't keep referencing a deleted row.
             active = DB.get_config(s, "active_session_id")
             if active and active.isdigit() and int(active) == sid:
                 DB.del_config(s, "active_session_id")
-            s.delete(sess); s.commit()
+            s.delete(sess)
+            s.commit()
         return jsonify({"ok": True})
+
     body = request.json or {}
     with DB.SessionLocal() as s:
         sess = s.get(DB.Session_, sid)
-        if not sess: return jsonify({"error": "not found"}), 404
-        if "name" in body and body["name"]: sess.name = body["name"].strip()
-        if "mode" in body and body["mode"] in ("student", "worker"): sess.mode = body["mode"]
-        if "group_name" in body: sess.group_name = body["group_name"] or None
+        if not sess:
+            return jsonify({"error": "not found"}), 404
+        if "name" in body and body["name"]:
+            sess.name = body["name"].strip()
+        if "mode" in body and body["mode"] in ("student", "worker"):
+            sess.mode = body["mode"]
+        if "group_name" in body:
+            sess.group_name = body["group_name"] or None
         if "start_time" in body and body["start_time"]:
             from datetime import time as Time
             h, m = [int(x) for x in body["start_time"].split(":")]
@@ -553,271 +999,64 @@ def api_session_modify(sid: int):
             sess.date = Date_.fromisoformat(body["session_date"])
         if "member_ids" in body:
             DB.set_session_members(s, sid, [int(x) for x in (body["member_ids"] or [])])
-        s.commit(); s.refresh(sess)
+        s.commit()
+        s.refresh(sess)
         mids = DB.get_session_member_ids(s, sid)
         return jsonify(_session_to_dict(sess, member_ids=mids))
 
-@app.route("/api/persons")
-def api_persons():
+
+# ----- Phone IP cam: front/back toggle -------------------------------------
+
+@app.route("/api/camera/toggle_front", methods=["POST"])
+def api_camera_toggle_front():
+    """Toggle the phone's front/back camera. Server tracks the state so the
+    frontend never gets out of sync."""
+    cam = PIPELINE.camera
+    if not cam or not isinstance(cam.source, str) or not cam.source.startswith(("http://", "https://")):
+        return jsonify({"error": "Only works when the camera is a phone IP-cam URL."}), 400
+    use_front = not PIPELINE.ffc_front
+    from urllib.parse import urlparse
+    import urllib.request
+    u = urlparse(cam.source)
+    base = f"{u.scheme}://{u.netloc}"
+    target = f"{base}/settings/ffc?set={'on' if use_front else 'off'}"
+    try:
+        with urllib.request.urlopen(target, timeout=3) as r:
+            r.read()
+    except Exception as e:
+        return jsonify({"error": f"Phone didn't respond at {target}: {e}"}), 502
+    PIPELINE.ffc_front = use_front
+    rot = 270 if use_front else 90
+    was_processing = PIPELINE.is_processing
+    if was_processing:
+        PIPELINE.stop_processing()
     with DB.SessionLocal() as s:
-        rows = s.execute(select(DB.Person).order_by(DB.Person.name)).scalars().all()
-    return jsonify([_person_to_dict(p) for p in rows])
+        DB.set_config(s, "camera_rotation", str(rot))
+    PIPELINE.set_camera(cam.source, rotation=rot)
+    if was_processing or active_session_id() is not None:
+        PIPELINE.start_processing()
+    return jsonify({"ok": True, "front": use_front, "rotation": rot})
 
-@app.route("/api/persons/<int:pid>", methods=["DELETE"])
-def api_delete_person(pid: int):
-    with DB.SessionLocal() as s:
-        p = s.get(DB.Person, pid)
-        if not p: return jsonify({"error": "not found"}), 404
-        s.delete(p); s.commit()
-        for info in list(PIPELINE.tracker._infos.values()):
-            if info.person_id == pid:
-                info.person_id = None; info.name = None
-                info.recognition_attempts = 0; info.last_recognition_frame = -10**9
-    return jsonify({"ok": True})
 
-@app.route("/api/enroll/precheck", methods=["POST"])
-def api_enroll_precheck():
-    if not PIPELINE.ensure_camera():
-        return jsonify({"recognized": False})
-    frame, _ = PIPELINE.camera.read()
-    if frame is None: return jsonify({"recognized": False})
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    faces = REC.detect_and_embed(rgb)
-    if not faces: return jsonify({"recognized": False, "face_detected": False})
-    face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-    detected_pose = REC.estimate_pose(rgb, mirror=PIPELINE.ffc_front)
-    with DB.SessionLocal() as s:
-        person, dist = DB.find_nearest(s, face.embedding, threshold=PIPELINE.match_threshold)
-        if person:
-            return jsonify({"recognized": True, "person": _person_to_dict(person),
-                            "distance": round(dist, 3), "pose": detected_pose,
-                            "samples": DB.count_samples(s, person.id)})
-    return jsonify({"recognized": False, "face_detected": True, "pose": detected_pose})
+# ============================================================ entry point ===
 
-@app.route("/api/enroll", methods=["POST"])
-def api_enroll():
-    body = request.json or {}
-    name = (body.get("name") or "").strip()
-    ext_id = (body.get("external_id") or "").strip()
-    group = body.get("group_name") or None
-    role = body.get("role") or "student"
-    pose = (body.get("pose") or "").strip().lower() or None
-    if not name or not ext_id:
-        return jsonify({"error": "name and external_id required"}), 400
-    if not PIPELINE.ensure_camera():
-        return jsonify({"error": "camera not available"}), 503
-    for _retry in range(20):
-        frame, _idx = PIPELINE.camera.read()
-        if frame is not None: break
-        time.sleep(0.05)
-    if frame is None:
-        return jsonify({"error": "no frame from camera"}), 400
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    faces = REC.detect_and_embed(rgb)
-    if not faces: return jsonify({"error": "no face detected"}), 400
-    face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-    detected_pose = REC.estimate_pose(rgb, mirror=PIPELINE.ffc_front)
-    emb = face.embedding
-    n = emb / (np.linalg.norm(emb) + 1e-9)
-
-    with DB.SessionLocal() as s:
-        existing = s.execute(select(DB.Person).where(DB.Person.external_id == ext_id)).scalar_one_or_none()
-        if existing:
-            person = existing
-            person.name = name; person.group_name = group; person.role = role
-        else:
-            person = DB.Person(name=name, external_id=ext_id, group_name=group, role=role)
-            s.add(person); s.flush()
-
-        if pose:
-            old = s.execute(select(DB.FaceSample).where(
-                DB.FaceSample.person_id == person.id, DB.FaceSample.pose_label == pose)).scalars().all()
-            for o in old: s.delete(o)
-
-        DB.add_face_sample(s, person, n, pose_label=pose)
-        DB.store_embedding(person, n)
-        s.commit()
-        total_samples = DB.count_samples(s, person.id)
-        for info in PIPELINE.tracker._infos.values():
-            if info.person_id is None:
-                info.recognition_attempts = 0
-                info.last_recognition_frame = -10**9
-    return jsonify({"ok": True, "person": _person_to_dict(person),
-                    "total_samples": total_samples, "pose": pose,
-                    "detected_pose": detected_pose, "is_update": existing is not None})
-
-@app.route("/api/dashboard")
-def api_dashboard():
-    sid = request.args.get("session_id", type=int) or active_session_id()
-    if not sid: return jsonify({"error": "no active session"}), 404
-    with DB.SessionLocal() as s:
-        sess = s.get(DB.Session_, sid)
-        if not sess: return jsonify({"error": "not found"}), 404
-        attendances = s.execute(select(DB.Attendance).where(DB.Attendance.session_id == sid)).scalars().all()
-        att_by_pid = {a.person_id: a for a in attendances}
-        member_ids = DB.get_session_member_ids(s, sid)
-        if member_ids:
-            all_ids = list(set(member_ids) | set(att_by_pid.keys()))
-            people_q = select(DB.Person).where(DB.Person.id.in_(all_ids))
-        elif sess.group_name:
-            att_pids = list(att_by_pid.keys())
-            if att_pids:
-                people_q = select(DB.Person).where(
-                    or_(DB.Person.group_name == sess.group_name, DB.Person.id.in_(att_pids)))
-            else:
-                people_q = select(DB.Person).where(DB.Person.group_name == sess.group_name)
-        else:
-            people_q = select(DB.Person)
-        people = s.execute(people_q).scalars().all()
-        present, late, absent = 0, 0, 0
-        rows = []
-        for p in people:
-            a = att_by_pid.get(p.id)
-            if a is None: status = "absent"; absent += 1
-            elif a.status == "late": status = "late"; late += 1
-            else: status = "present"; present += 1
-            rows.append({"person_id": p.id, "name": p.name, "external_id": p.external_id,
-                         "status": status,
-                         "arrival_ts": a.arrival_ts.isoformat() if a else None,
-                         "departure_ts": a.departure_ts.isoformat() if a and a.departure_ts else None,
-                         "hours": round((a.departure_ts - a.arrival_ts).total_seconds()/3600, 2) if a and a.departure_ts else None,
-                         "thumbnail": url_for("static", filename=p.thumbnail_path) if p.thumbnail_path else None})
-        start_h = sess.start_time.hour
-        end_h = min(24, max((a.arrival_ts.hour + 1 for a in attendances), default=start_h + 1))
-        end_h = max(end_h, datetime.now().hour + 1) if sess.date == Date.today() else end_h
-        hourly_range = list(range(start_h, min(end_h, 24)))
-        hourly = {h: 0 for h in hourly_range}
-        for a in attendances:
-            if a.arrival_ts.hour in hourly: hourly[a.arrival_ts.hour] += 1
-        unk_count = s.execute(select(func.count(DB.Unknown.id)).where(DB.Unknown.session_id == sid)).scalar() or 0
-        return jsonify({"session": _session_to_dict(sess),
-                        "counts": {"present": present, "late": late, "absent": absent, "total": len(people)},
-                        "rows": rows, "hourly_labels": [f"{h}:00" for h in hourly_range],
-                        "hourly": list(hourly.values()), "unknown_count": int(unk_count)})
-
-@app.route("/api/dashboard/export")
-def api_dashboard_export():
-    sid = request.args.get("session_id", type=int) or active_session_id()
-    if not sid: return Response("no active session", 404)
-    with DB.SessionLocal() as s:
-        sess = s.get(DB.Session_, sid)
-        if not sess: return Response("not found", 404)
-        att_rows = s.execute(select(DB.Attendance).where(DB.Attendance.session_id == sid)).scalars().all()
-        att_by_pid = {a.person_id: a for a in att_rows}
-        member_ids = DB.get_session_member_ids(s, sid)
-        if member_ids:
-            all_ids = list(set(member_ids) | set(att_by_pid.keys()))
-            people_q = select(DB.Person).where(DB.Person.id.in_(all_ids))
-        elif sess.group_name:
-            att_pids = list(att_by_pid.keys())
-            if att_pids:
-                people_q = select(DB.Person).where(
-                    or_(DB.Person.group_name == sess.group_name, DB.Person.id.in_(att_pids)))
-            else:
-                people_q = select(DB.Person).where(DB.Person.group_name == sess.group_name)
-        else:
-            people_q = select(DB.Person)
-        people = s.execute(people_q).scalars().all()
-        out = io.StringIO()
-        w = csv.writer(out)
-        w.writerow(["external_id", "name", "group", "role", "status", "arrival_ts", "departure_ts", "hours"])
-        for p in people:
-            a = att_by_pid.get(p.id)
-            status = "absent" if a is None else a.status
-            arr = a.arrival_ts.isoformat() if a else ""
-            dep = a.departure_ts.isoformat() if a and a.departure_ts else ""
-            hrs = round((a.departure_ts - a.arrival_ts).total_seconds()/3600, 2) if a and a.departure_ts else ""
-            w.writerow([p.external_id, p.name, p.group_name or "", p.role, status, arr, dep, hrs])
-        data = out.getvalue().encode("utf-8")
-        fname = f"attendance_{sess.name}_{sess.date.isoformat()}.csv"
-        return Response(data, mimetype="text/csv",
-                        headers={"Content-Disposition": f"attachment; filename={fname}"})
-
-@app.route("/api/person/<int:pid>")
-def api_person(pid: int):
-    with DB.SessionLocal() as s:
-        p = s.get(DB.Person, pid)
-        if not p: return jsonify({"error": "not found"}), 404
-        cutoff = Date.today() - timedelta(days=30)
-        rows = s.execute(
-            select(DB.Attendance, DB.Session_).join(DB.Session_)
-            .where(DB.Attendance.person_id == pid, DB.Session_.date >= cutoff)
-            .order_by(DB.Session_.date.desc())).all()
-        history = []
-        by_date: dict[str, str] = {}
-        for a, sess in rows:
-            d = sess.date.isoformat()
-            history.append({"date": d, "session": sess.name, "status": a.status,
-                            "arrival_ts": a.arrival_ts.isoformat(),
-                            "departure_ts": a.departure_ts.isoformat() if a.departure_ts else None})
-            if d not in by_date or by_date[d] == "present":
-                by_date[d] = a.status
-        grid = [{"date": (Date.today() - timedelta(days=i)).isoformat(),
-                 "status": by_date.get((Date.today() - timedelta(days=i)).isoformat(), "none")} for i in range(29, -1, -1)]
-        sessions_total = s.execute(select(func.count(DB.Session_.id)).where(DB.Session_.date >= cutoff)).scalar() or 0
-        present_count = sum(1 for h in history if h["status"] in ("present", "late"))
-        pct = round(100 * present_count / sessions_total, 1) if sessions_total else 0.0
-        return jsonify({"person": _person_to_dict(p), "history": history, "grid": grid,
-                        "attendance_pct": pct, "sessions_total": int(sessions_total)})
-
-@app.route("/api/unknowns")
-def api_unknowns():
-    with DB.SessionLocal() as s:
-        rows = s.execute(select(DB.Unknown).order_by(DB.Unknown.seen_ts.desc()).limit(60)).scalars().all()
-    return jsonify([{"id": u.id, "seen_ts": u.seen_ts.isoformat(),
-                     "thumbnail": url_for("static", filename=u.thumbnail_path) if u.thumbnail_path else None,
-                     "session_id": u.session_id} for u in rows])
-
-@app.route("/api/health")
-def api_health():
-    return jsonify({"ok": True, "ts": datetime.now().isoformat()})
-
-@app.route("/api/live/snapshot")
-def api_live_snapshot():
-    data = PIPELINE.last_jpeg
-    if data is None:
-        if not PIPELINE.ensure_camera(): return Response("camera not available", 503)
-        frame, _ = PIPELINE.camera.read()
-        if frame is None: return Response("no frame from camera", 503)
-        with PIPELINE.lock:
-            annotated = PIPELINE.annotate_frame(frame, active_session_id())
-            data = PIPELINE.cache_jpeg(annotated, quality=90)
-    if data is None: return Response("encode failed", 500)
-    fname = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    return Response(data, mimetype="image/jpeg",
-                    headers={"Content-Disposition": f"attachment; filename={fname}"})
-
-@app.route("/api/thumbs/wipe", methods=["POST"])
-def api_thumbs_wipe():
-    deleted_files = 0
-    for f in THUMBS_DIR.glob("*"):
-        try: f.unlink(); deleted_files += 1
-        except OSError: pass
-    with DB.SessionLocal() as s:
-        cleared = 0
-        for p in s.execute(select(DB.Person)).scalars():
-            if p.thumbnail_path: p.thumbnail_path = None; cleared += 1
-        for u in s.execute(select(DB.Unknown)).scalars():
-            if u.thumbnail_path: u.thumbnail_path = None; cleared += 1
-        s.commit()
-    return jsonify({"deleted_files": deleted_files, "cleared_rows": cleared, "store_thumbnails": STORE_THUMBNAILS})
-
-# =================================================================== Entry ===
 def _startup():
     info = DB.init_db()
-    log.info("We initialized the database: %s", info)
+    log.info("DB ready: %s", info)
     rec_info = REC.init(prefer=os.environ.get("RECOGNITION"))
     PIPELINE.recognition_path = rec_info
     if "MATCH_THRESHOLD" not in os.environ:
         thresholds = {"insightface": 0.45, "facenet": 0.38, "dlib": 0.40, "lbp": 0.40}
         PIPELINE.match_threshold = thresholds.get(rec_info["backend"], 0.50)
-        log.info("We auto-set match_threshold=%.2f for %s backend", PIPELINE.match_threshold, rec_info["backend"])
+        log.info("Auto-set match_threshold=%.2f for %s backend", PIPELINE.match_threshold, rec_info["backend"])
+
 
 if __name__ == "__main__":
     _startup()
     if active_session_id() is not None:
-        log.info("We are resuming an active session — starting background processing")
+        log.info("Resuming active session — starting background processing")
         PIPELINE.start_processing()
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
+    # threaded=True so the MJPEG generator and other requests can run concurrently
     app.run(host=host, port=port, threaded=True, debug=False)
