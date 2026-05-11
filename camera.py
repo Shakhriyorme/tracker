@@ -1,19 +1,22 @@
-# camera.py
-"""We built this module to handle all webcam and IP-camera inputs reliably.
-We added a background thread so the Flask route never blocks waiting for a frame.
-We also implemented auto-reconnect and rotation support for phone cameras.
+"""Camera capture abstraction. Handles webcam index or IP-cam URL.
+
+The capture runs in a background thread so the Flask MJPEG generator can read
+the latest frame at its own pace without blocking on grab().
 """
+from __future__ import annotations
+
 import logging
 import threading
 import time
 from typing import Optional
+
 import cv2
 import numpy as np
 
 log = logging.getLogger("attendance.camera")
 
+
 def _parse_source(source: str | int) -> int | str:
-    # I wrote this helper to normalize indices vs URLs automatically.
     if isinstance(source, int):
         return source
     s = str(source).strip()
@@ -22,11 +25,10 @@ def _parse_source(source: str | int) -> int | str:
     if s.startswith(("http://", "https://")):
         from urllib.parse import urlparse
         u = urlparse(s)
-        # I auto-append /video for Android IP Webcam apps since I noticed it's often missing.
         if not u.path or u.path == "/":
             return s.rstrip("/") + "/video"
-        return s
-    return source
+    return s
+
 
 class Camera:
     ROTATIONS = {
@@ -38,28 +40,34 @@ class Camera:
 
     def __init__(self, source: str | int = 0, rotation: int = 0, front_camera: bool = False):
         self.source = _parse_source(source)
-        self.rotation = rotation
-        self.front_camera = front_camera
+        self.rotation: int = rotation
+        self.front_camera: bool = front_camera
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame: Optional[np.ndarray] = None
         self._frame_idx = 0
-        self._lock = threading.Lock()  # I added this lock to make frame reads thread-safe.
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.last_error: Optional[str] = None
 
     def start(self) -> bool:
         self._stop.clear()
         self._cap = cv2.VideoCapture(self.source)
         if not self._cap.isOpened():
-            log.error("I couldn't open camera source: %s", self.source)
+            hint = ""
+            if isinstance(self.source, str) and self.source.startswith(("http://", "https://", "rtsp://")):
+                hint = ("  Phone tip: open the URL in a browser first to confirm it streams. "
+                        "For the Android 'IP Webcam' app, the MJPEG path is /video — "
+                        "we auto-append it if missing.")
+            self.last_error = f"Could not open camera source: {self.source}.{hint}"
+            log.error(self.last_error)
             return False
-        # I set standard resolution to keep FPS stable on most devices.
         if isinstance(self.source, int):
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self._thread = threading.Thread(target=self._loop, name="camera", daemon=True)
         self._thread.start()
-        log.info("I started the camera capture thread for source: %s", self.source)
+        log.info("Camera started: %s", self.source)
         return True
 
     def stop(self) -> None:
@@ -69,16 +77,19 @@ class Camera:
         if self._cap:
             self._cap.release()
             self._cap = None
-        log.info("I stopped the camera and released the device.")
+
+    def is_open(self) -> bool:
+        return self._cap is not None and self._cap.isOpened()
 
     def _loop(self) -> None:
         backoff = 0.05
         while not self._stop.is_set():
+            assert self._cap is not None
             ok, frame = self._cap.read()
             if not ok or frame is None:
+                self.last_error = "read() returned no frame; will retry"
                 time.sleep(backoff)
                 backoff = min(backoff * 1.5, 1.0)
-                # I implemented this fallback to automatically retry if the stream drops.
                 if backoff >= 1.0:
                     self._cap.release()
                     self._cap = cv2.VideoCapture(self.source)
